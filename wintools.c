@@ -17,6 +17,7 @@ static uint64_t FindNTKernel(const WinCtx* ctx, uint64_t kernelEntry);
 static uint16_t GetNTVersion(const WinCtx* ctx);
 static uint32_t GetNTBuild(const WinCtx* ctx);
 static int SetupOffsets(WinCtx* ctx);
+static WinModule GetBaseModule(const WinCtx* ctx, const WinProc* process);
 static void FillAnyModuleList64(const WinCtx* ctx, const WinProc* process, WinModuleList* list, size_t* maxSize, uint64_t head, int inMemoryOrder);
 static void FillModuleList64(const WinCtx* ctx, const WinProc* process, WinModuleList* list, size_t* maxSize, char* x86);
 static void FillModuleList32(const WinCtx* ctx, const WinProc* process, WinModuleList* list, size_t* maxSize);
@@ -279,13 +280,13 @@ WinProcList GenerateProcessList(const WinCtx* ctx)
 	list.size = 0;
 	size_t maxSize = 25;
 
-	while (!list.size || curProc != ctx->initialProcess.physProcess) {
-		uint64_t session = MemReadU64(&ctx->process, curProc + ctx->offsets.session);
+	while (!list.size || (curProc != ctx->initialProcess.physProcess && virtProcess != ctx->initialProcess.process)) {
+		uint64_t stackCount = MemReadU64(&ctx->process, curProc + ctx->offsets.stackCount);
 		uint64_t dirBase = MemReadU64(&ctx->process, curProc + ctx->offsets.dirBase);
 		uint64_t pid = MemReadU64(&ctx->process, curProc + ctx->offsets.apl - 8);
 
-		//Check if process is running by checking the session. System process never has a session, and this session checking does not seem to fully work on XP
-		if (session || pid == 4) {
+		/* The end of the process list usually has corrupted values, some sort of address, and we avoid the issue by checking the PID (which shouldn't be over 32 bit limit anyways) */
+		if (pid < 1u << 31 && stackCount) {
 			list.list[list.size] = (WinProc){
 				.process = virtProcess,
 				.physProcess = curProc,
@@ -293,8 +294,14 @@ WinProcList GenerateProcessList(const WinCtx* ctx)
 				.pid = pid,
 			};
 
-			MemRead(&ctx->process, (uint64_t)list.list[list.size].name, curProc + ctx->offsets.imageFileName, 15);
-			list.list[list.size].name[15] = '\0';
+			WinModule baseMod = GetBaseModule(ctx, &list.list[list.size]);
+			if (baseMod.name)
+				list.list[list.size].name = baseMod.name;
+			else {
+				list.list[list.size].name = (char*)malloc(16);
+				MemRead(&ctx->process, (uint64_t)list.list[list.size].name, curProc + ctx->offsets.imageFileName, 15);
+				list.list[list.size].name[15] = '\0';
+			}
 
 			list.size++;
 			if (list.size > 1000 || pid == 0)
@@ -319,6 +326,17 @@ WinProcList GenerateProcessList(const WinCtx* ctx)
 	}
 
 	return list;
+}
+
+void FreeProcessList(WinProcList list)
+{
+	size_t i;
+
+	if (list.list) {
+		for (i = 0; i < list.size; i++)
+			free(list.list[i].name);
+		free(list.list);
+	}
 }
 
 WinModuleList GenerateModuleList(const WinCtx* ctx, const WinProc* process)
@@ -500,6 +518,7 @@ static int SetupOffsets(WinCtx* ctx)
 		  ctx->offsets = (WinOffsets){
 			  .apl = 0xe0,
 			  .session = 0x260,
+			  .stackCount = 0xa0,
 			  .imageFileName = 0x268,
 			  .dirBase = 0x28,
 			  .peb = 0x2c0,
@@ -513,6 +532,7 @@ static int SetupOffsets(WinCtx* ctx)
 		  ctx->offsets = (WinOffsets){
 			  .apl = 0x188,
 			  .session = 0x2d8,
+			  .stackCount = 0xdc,
 			  .imageFileName = 0x2e0,
 			  .dirBase = 0x28,
 			  .peb = 0x338,
@@ -529,6 +549,7 @@ static int SetupOffsets(WinCtx* ctx)
 		  ctx->offsets = (WinOffsets){
 			  .apl = 0x2e8,
 			  .session = 0x430,
+			  .stackCount = 0x234,
 			  .imageFileName = 0x438,
 			  .dirBase = 0x28,
 			  .peb = 0x338, /*peb will be wrong on Windows 8 and 8.1*/
@@ -542,6 +563,7 @@ static int SetupOffsets(WinCtx* ctx)
 		  ctx->offsets = (WinOffsets){
 			  .apl = 0x2e8,
 			  .session = 0x430,
+			  .stackCount = 0x234,
 			  .imageFileName = 0x438,
 			  .dirBase = 0x28,
 			  .peb = 0x338,
@@ -555,6 +577,7 @@ static int SetupOffsets(WinCtx* ctx)
 		  ctx->offsets = (WinOffsets){
 			  .apl = 0x2e8,
 			  .session = 0x448,
+			  .stackCount = 0x23c,
 			  .imageFileName = 0x450,
 			  .dirBase = 0x28,
 			  .peb = 0x3f8,
@@ -596,13 +619,76 @@ static void FillModuleList64(const WinCtx* ctx, const WinProc* process, WinModul
 	}
 }
 
+static int FillModuleInfo64(const WinCtx* ctx, const WinProc* process, uint64_t* head, int inMemoryOrder, WinModule* modinfo)
+{
+	const size_t NAME_LEN = 128;
+	wchar_t buf[128];
+
+	LDR_MODULE mod;
+	memset(&mod, 0, sizeof(mod));
+
+	VMemRead(&ctx->process, process->dirBase, (uint64_t)&mod, *head - sizeof(LIST_ENTRY) * inMemoryOrder, sizeof(mod));
+	VMemRead(&ctx->process, process->dirBase, (uint64_t)head, *head, sizeof(*head));
+
+	if (!mod.BaseDllName.length || !mod.SizeOfImage)
+		return 1;
+
+	/* Cap the module size */
+	if (mod.BaseDllName.length >= NAME_LEN)
+		mod.BaseDllName.length = NAME_LEN;
+
+	VMemRead(&ctx->process, process->dirBase, (uint64_t)buf, mod.BaseDllName.buffer, mod.BaseDllName.length * sizeof(wchar_t));
+	char* buf2 = (char*)malloc(mod.BaseDllName.length);
+	for (int i = 0; i < mod.BaseDllName.length; i++)
+		buf2[i] = ((char*)buf)[i*2];
+	buf2[mod.BaseDllName.length-1] = '\0';
+
+	if (*(short*)(void*)buf2 == 0x53) { /* 'S\0', a bit of magic, but it works */
+		free(buf2);
+		return 2;
+	}
+
+	modinfo->name = buf2;
+	modinfo->baseAddress = mod.BaseAddress;
+	modinfo->entryPoint = mod.EntryPoint;
+	modinfo->sizeOfModule = mod.SizeOfImage;
+	modinfo->loadCount = mod.LoadCount;
+
+	return 0;
+}
+
+static WinModule GetBaseModule(const WinCtx* ctx, const WinProc* process)
+{
+	WinModule mod;
+	mod.name = NULL;
+
+	PEB peb = GetPeb(ctx, process);
+	PEB_LDR_DATA ldr;
+	memset(&ldr, 0, sizeof(ldr));
+	VMemRead(&ctx->process, process->dirBase, (uint64_t)&ldr, peb.Ldr, sizeof(ldr));
+
+	uint64_t head = ldr.InMemoryOrderModuleList.f_link;
+	uint64_t end = head;
+	uint64_t prev = head+1;
+
+	do {
+		if (!FillModuleInfo64(ctx, process, &head, 1, &mod)) {
+			if (mod.baseAddress == peb.ImageBaseAddress) {
+				break;
+			} else {
+				free(mod.name);
+				mod.name = NULL;
+			}
+		}
+	} while (head != end && head != prev);
+
+	return mod;
+}
+
 static void FillAnyModuleList64(const WinCtx* ctx, const WinProc* process, WinModuleList* list, size_t* maxSize, uint64_t head, int inMemoryOrder)
 {
 	uint64_t end = head;
 	uint64_t prev = head+1;
-
-	size_t nameBufSize = 128;
-	wchar_t* buf = (wchar_t*)malloc(sizeof(wchar_t) * nameBufSize);
 
 	if (inMemoryOrder)
 		inMemoryOrder = 1;
@@ -617,40 +703,10 @@ static void FillAnyModuleList64(const WinCtx* ctx, const WinProc* process, WinMo
 		}
 		prev = head;
 
-		LDR_MODULE mod;
-		memset(&mod, 0, sizeof(mod));
-		VMemRead(&ctx->process, process->dirBase, (uint64_t)&mod, head - sizeof(LIST_ENTRY) * inMemoryOrder, sizeof(mod));
-		VMemRead(&ctx->process, process->dirBase, (uint64_t)&head, head, sizeof(head));
-
-		if (!mod.BaseDllName.length || !mod.SizeOfImage)
-			continue;
-
-		if (mod.BaseDllName.length >= nameBufSize) {
-			nameBufSize = mod.BaseDllName.length * 2;
-			buf = (wchar_t*)realloc(buf, sizeof(wchar_t) * nameBufSize);
-		}
-
-		VMemRead(&ctx->process, process->dirBase, (uint64_t)buf, mod.BaseDllName.buffer, mod.BaseDllName.length * sizeof(wchar_t));
-		char* buf2 = (char*)malloc(mod.BaseDllName.length);
-		for (int i = 0; i < mod.BaseDllName.length; i++)
-			buf2[i] = ((char*)buf)[i*2];
-		buf2[mod.BaseDllName.length-1] = '\0';
-
-		if (*(short*)(void*)buf2 == 0x53) { /* 'S\0', a bit of magic, but it works */
-			free(buf2);
-			continue;
-		}
-
-		list->list[list->size].name = buf2;
-		list->list[list->size].baseAddress = mod.BaseAddress;
-		list->list[list->size].entryPoint = mod.EntryPoint;
-		list->list[list->size].sizeOfModule = mod.SizeOfImage;
-		list->list[list->size].loadCount = mod.LoadCount;
-		list->size++;
+		if (!FillModuleInfo64(ctx, process, &head, inMemoryOrder, list->list + list->size))
+			list->size++;
 
 	} while (head != end && head != prev);
-
-	free(buf);
 }
 
 static void FillModuleList32(const WinCtx* ctx, const WinProc* process, WinModuleList* list, size_t* maxSize)
