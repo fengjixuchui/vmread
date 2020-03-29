@@ -25,6 +25,8 @@ static void FillModuleList32(const WinCtx* ctx, const WinProc* process, WinModul
 extern uint64_t KFIXC;
 extern uint64_t KFIXO;
 
+FILE* vmread_dfile = NULL;
+
 #ifndef HEADER_SIZE
 #define HEADER_SIZE 0x1000
 #endif
@@ -672,6 +674,8 @@ static WinModule GetBaseModule(const WinCtx* ctx, const WinProc* process)
 	uint64_t prev = head+1;
 
 	do {
+		prev = head;
+
 		if (!FillModuleInfo64(ctx, process, &head, 1, &mod)) {
 			if (mod.baseAddress == peb.ImageBaseAddress) {
 				break;
